@@ -251,3 +251,35 @@ def _check_default_mega(f, *, variant, implementation=None, large_merge=None):
     assert metrics["finite_output"], metrics
     assert metrics["relative_l2"] < 0.07, metrics
     assert metrics["lse_max_abs"] < 0.06, metrics
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("enable_fp_fusion", [False, True])
+def test_unfused_rope_preserves_rounding(dtype, enable_fp_fusion):
+    """CUDA 13.0 f32x2 contraction must not change the baseline's BF16 Q."""
+    from tests.attention.sparse_mla_prefill_utils import _rope
+    from tests.attention.sparse_mla_test_utils import require_sm12x
+
+    require_sm12x()
+    # Both pairs straddle a BF16 rounding boundary when mul/add contracts.
+    pairs = torch.tensor([[0.65234375, -1.0078125], [0.2451171875, -0.515625]])
+    cos = torch.tensor([0.8002690076828003, -0.9704814553260803])
+    sin = torch.tensor([-0.5996412038803101, 0.2411758452653885])
+    q = torch.zeros(2, 1, 512, dtype=torch.bfloat16)
+    q[..., 448:] = pairs[:, None, :].repeat(1, 1, 32)
+    cs = torch.cat((cos[:, None].expand(-1, 32), sin[:, None].expand(-1, 32)), 1)
+    # Separate eager CPU operations give independently rounded FP32 products.
+    x, y = pairs.unbind(1)
+    expected_pair = torch.stack((x * cos - y * sin, y * cos + x * sin), 1)
+    expected = q.float()
+    expected[..., 448:] = expected_pair[:, None, :].repeat(1, 1, 32)
+    actual = torch.empty_like(q, device="cuda", dtype=dtype)
+    _rope[(2,)](
+        q.cuda(),
+        actual,
+        torch.arange(2, device="cuda", dtype=torch.int32),
+        cs.cuda(),
+        1,
+        enable_fp_fusion=enable_fp_fusion,
+    )
+    torch.testing.assert_close(actual.cpu(), expected.to(dtype), atol=0, rtol=0)

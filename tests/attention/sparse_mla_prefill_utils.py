@@ -14,6 +14,22 @@ import triton.language as tl  # noqa: E402
 
 
 @triton.jit
+def _rope_rn(x, c, other, s):
+    # CUDA 13.0 ptxas contracts Triton's f32x2 mul/add into FFMA even with
+    # enable_fp_fusion=False. Scalar rounded PTX matches mega_rotate's
+    # separate FP32 products/addition before the BF16 or FP8 conversion.
+    return tl.inline_asm_elementwise(
+        "{ .reg .f32 a, b; mul.rn.f32 a, $1, $2; "
+        "mul.rn.f32 b, $3, $4; add.rn.f32 $0, a, b; }",
+        constraints="=f,f,f,f,f",
+        args=[x, c, other, s],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
 def _rope(X, Y, Positions, CS, H: tl.constexpr):
     row = tl.program_id(0)
     d = tl.arange(0, 512)
@@ -23,7 +39,7 @@ def _rope(X, Y, Positions, CS, H: tl.constexpr):
     r = (d - 448) // 2
     c = tl.load(CS + pos * 64 + r, d >= 448, other=1)
     s = tl.load(CS + pos * 64 + 32 + r, d >= 448, other=0)
-    y = x * c + tl.where(d % 2 == 0, -other, other) * s
+    y = _rope_rn(x, c, tl.where(d % 2 == 0, -other, other), s)
     tl.store(Y + row * 512 + d, y)
 
 
@@ -37,7 +53,7 @@ def _epilogue(X, Y, SF, Positions, CS, H: tl.constexpr):
     r = (d - 448) // 2
     c = tl.load(CS + pos * 64 + r, d >= 448, other=1)
     s = tl.load(CS + pos * 64 + 32 + r, d >= 448, other=0)
-    y = x * c + tl.where(d % 2 == 0, other, -other) * s
+    y = _rope_rn(x, c, tl.where(d % 2 == 0, other, -other), s)
     blocks = tl.reshape(y, (16, 32))
     amax = tl.maximum(tl.max(tl.abs(blocks), 1), 1.0e-4)
     # IEEE exponent rounding, also handles exact powers of two.
